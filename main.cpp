@@ -9,6 +9,8 @@
 #include <thread>
 #include <cstdlib>
 
+#define A0 17
+
 using json = nlohmann::json;
 
 // Константы для задержек (в миллисекундах)
@@ -18,11 +20,17 @@ constexpr int RECONNECT_DELAY = 5000;   // 5s задержка между поп
 constexpr int MAX_RECONNECT_ATTEMPTS = 10; // Максимальное количество попыток реконнекта
 
 // Эмуляция состояния пинов
-std::map<uint8_t, bool> pinStates;
+std::map<uint8_t, uint8_t> pinStates;
+std::map<std::string, uint8_t> rgbPinSet = {
+   {"red",      3},
+   {"green",    5},
+   {"blue",     6} 
+};
 struct mosquitto *mosq = nullptr;
 bool shouldRestart = false;
 bool isConnected = false;
 int reconnectAttempts = 0;
+
 
 // Получение переменных окружения с значениями по умолчанию
 std::string getEnvVar(const char* name, const char* defaultValue) {
@@ -90,17 +98,18 @@ void pinMode(uint8_t pin, bool isOutput) {
     pinStates[pin] = false; // Инициализация состояния пина
 }
 
-// Функция для чтения значения с пина
-bool digitalRead(uint8_t pin) {
-    std::cout << "Reading from pin " << (int)pin << ": " << (pinStates[pin] ? "HIGH" : "LOW") << std::endl;
-    return pinStates[pin];
+
+// Функция для чтения аналогового значения с пина
+uint8_t analogRead(uint8_t pin){
+ return 0xFF;
 }
 
-// Функция для записи значения на пин
-void digitalWrite(uint8_t pin, bool value) {
-    std::cout << "Writing to pin " << (int)pin << ": " << (value ? "HIGH" : "LOW") << std::endl;
-    pinStates[pin] = value;
-    
+// Функция для записи аналогового значения (PWM) на пин
+void analogWrite(uint8_t pin, uint8_t value) { 
+    std::cout << "Setting Duty Cycle " << value + 0 << " on pin " << pin + 0
+    << "." << std::endl;
+    pinStates[pin] =  value;
+
     // Отправляем состояние пина в MQTT только если подключены
     if (mosq && isConnected) {
         json message;
@@ -137,6 +146,18 @@ void digitalWrite(uint8_t pin, bool value) {
     }
 }
 
+// Функция для чтения бинарного значения с пина
+bool digitalRead(uint8_t pin) {
+    std::cout << "Reading from pin " << (int)pin << ": " << (pinStates[pin] ? "HIGH" : "LOW") << std::endl;
+    return pinStates[pin] ? true : false;
+}
+
+// Функция для записи значения на пин
+void digitalWrite(uint8_t pin, bool value) {
+    std::cout << "Writing to digital pin " << (int)pin << ": " << (value ? "HIGH" : "LOW") << std::endl;
+    analogWrite(pin, (value ? 255 : 0) );   
+}
+
 // Callback для получения сообщений MQTT
 void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message) {
     if (!message->payload) {
@@ -161,7 +182,42 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
                     bool currentState = digitalRead(2);
                     digitalWrite(2, !currentState); // Инвертируем текущее состояние
                     shouldRestart = true;
+               
+                }else if(command == "set_rgb"){
+                    std::cout << "Received set_rgb command" << std::endl; 
+                    // Проверяем корректность команды
+                    for (const auto& [colorName, pinNumber] : rgbPinSet){
+                        // Проверяем наличие цвета в парамметрах команды
+                        if(!data.contains(colorName)){
+                            std::cout << "Invalid command. No " << colorName << " color in command parameters." << std::endl;
+                            return;   
+                        }
+                        
+                        // Проверяем корректное значение пина
+                        auto& field = data[colorName];
+                        if(!field.is_number_unsigned()){
+                            std::cout << "Invalid command. Wrong value for "<< colorName << " color."  
+                            <<std::endl;
+                            return;      
+                        } 
+                        
+                        // Проверяем корректное значение пина    
+                        uint64_t value  = field.get<std::uint64_t>();
+                        if( value >  255 ){
+                            std::cout << "Invalid command. Wrong value for "<< colorName << " color."  
+                            << std::endl;
+                            return;   
+                        } 
+                    }    
+                    
+                    // Устанавливаем значение пина
+                    for (const auto& [colorName, pinNumber] : rgbPinSet){
+                        uint8_t redDuty = data[colorName].get<std::uint8_t>();
+                        analogWrite( pinNumber, redDuty);
+                    }    
+                     
                 }
+                
             }
         }
     } catch (const std::exception& e) {
@@ -250,6 +306,8 @@ void loop() {
         digitalWrite(13, ledState);
     }
     
+    uint8_t tempC = analogRead(A0); 
+
     // Задержка основного цикла
     std::this_thread::sleep_for(std::chrono::milliseconds(MAIN_LOOP_DELAY));
 }
