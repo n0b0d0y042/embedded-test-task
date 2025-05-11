@@ -1,4 +1,5 @@
 #include <iostream>
+#include <sstream>
 #include <map>
 #include <cstdint>
 #include <string>
@@ -14,10 +15,22 @@
 using json = nlohmann::json;
 
 // Константы для задержек (в миллисекундах)
-constexpr int MAIN_LOOP_DELAY = 100;    // 100ms задержка основного цикла
-constexpr int MQTT_LOOP_DELAY = 10;     // 10ms задержка для обработки MQTT
-constexpr int RECONNECT_DELAY = 5000;   // 5s задержка между попытками реконнекта
-constexpr int MAX_RECONNECT_ATTEMPTS = 10; // Максимальное количество попыток реконнекта
+constexpr int MAIN_LOOP_DELAY           = 100;     // 100ms задержка основного цикла
+constexpr int MQTT_LOOP_DELAY           = 10;      // 10ms задержка для обработки MQTT
+constexpr int RECONNECT_DELAY           = 5000;    // 5s задержка между попытками реконнекта
+constexpr int TEMPERATUE_UPDATE_DELAY   = 5000;    // 5s задержка между обновлениями температуры
+constexpr int MAX_RECONNECT_ATTEMPTS    = 10;      // Максимальное количество попыток реконнекта
+
+// Константы для генерации показаний температуры
+constexpr float MIN_TEMPERATURE_C       = 20;      // Минимальаняа случайная температура
+constexpr float MAX_TEMPERATURE_C       = 30;      // Максимальная случайная температура
+constexpr float COFF_ADC_TO_TEMP_C      = 0.3039;  // Коэффицент для преобразования показаний ADC в температуру
+
+// Константы для работы c топиками MQTT 
+constexpr char CONRTORL_TOPIC_NAME[]    = "embedded/control"; 
+constexpr char PINSTATE_TOPIC_NAME[]    = "embedded/pins/state"; 
+constexpr char SENSOR_TEMP_TOPIC_NAME[] = "embedded/sensors/temperature"; 
+constexpr char ERROR_TOPIC_NAME[]       = "embedded/errors";
 
 // Эмуляция состояния пинов
 std::map<uint8_t, uint8_t> pinStates;
@@ -26,11 +39,17 @@ std::map<std::string, uint8_t> rgbPinSet = {
    {"green",    5},
    {"blue",     6} 
 };
+
+
 struct mosquitto *mosq = nullptr;
 bool shouldRestart = false;
 bool isConnected = false;
 int reconnectAttempts = 0;
 
+// Функция генерации случайного значения в диапазоне
+uint8_t random(uint8_t min, uint8_t max) {
+    return random()%(max-min) + min; 
+}
 
 // Получение переменных окружения с значениями по умолчанию
 std::string getEnvVar(const char* name, const char* defaultValue) {
@@ -66,6 +85,40 @@ bool connectToMqtt() {
     return true;
 }
 
+// Функция для публикации значения в топик MQTT
+bool publishToMqttSafe( const char *topic, const json& message){
+    if (!mosq || !isConnected){
+        return false;
+    }
+    
+    std::string payload = message.dump();
+    // Добавляем обработку ошибок и повторные попытки публикации
+    int retries = 3;
+    while (retries > 0) {
+        int rc = mosquitto_publish(mosq, nullptr, topic, payload.length(), payload.c_str(), 1, false); // QoS=1 для гарантированной доставки
+        if (rc == MOSQ_ERR_SUCCESS) {
+            std::cout << "Successfully published MQTT message" << std::endl;
+            
+            // Важно: нужно вызвать mosquitto_loop для обработки исходящих сообщений
+            mosquitto_loop(mosq, 100, 1); // Даем время на обработку сообщения
+            break;
+        } else if (rc == MOSQ_ERR_NO_CONN) {
+            std::cerr << "No connection to broker, attempting to reconnect..." << std::endl;
+            if (connectToMqtt()) {
+                mosquitto_loop(mosq, 100, 1);
+            }
+        } else {
+            std::cerr << "Failed to publish MQTT message: " << mosquitto_strerror(rc) << std::endl;
+        }
+        retries--;
+        if (retries > 0) {
+            std::cout << "Retrying publish... (" << retries << " attempts left)" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    return true;
+}
 // Callback для подключения к MQTT
 void connect_callback(struct mosquitto *mosq, void *obj, int result) {
     if (result == MOSQ_ERR_SUCCESS) {
@@ -74,7 +127,7 @@ void connect_callback(struct mosquitto *mosq, void *obj, int result) {
         reconnectAttempts = 0;
         
         // Подписываемся на топик после подключения
-        int rc = mosquitto_subscribe(mosq, nullptr, "embedded/control", 0);
+        int rc = mosquitto_subscribe(mosq, nullptr, CONRTORL_TOPIC_NAME, 0);
         if (rc != MOSQ_ERR_SUCCESS) {
             std::cerr << "Failed to subscribe to topic: " << mosquitto_strerror(rc) << std::endl;
         } else {
@@ -101,49 +154,25 @@ void pinMode(uint8_t pin, bool isOutput) {
 
 // Функция для чтения аналогового значения с пина
 uint8_t analogRead(uint8_t pin){
- return 0xFF;
+    return random( MIN_TEMPERATURE_C/COFF_ADC_TO_TEMP_C, MAX_TEMPERATURE_C/COFF_ADC_TO_TEMP_C);
 }
 
 // Функция для записи аналогового значения (PWM) на пин
 void analogWrite(uint8_t pin, uint8_t value) { 
+    //Устанавливаем значение
     std::cout << "Setting Duty Cycle " << value + 0 << " on pin " << pin + 0
     << "." << std::endl;
     pinStates[pin] =  value;
+    //Публикуем значение на MQTT
+    json message;
+    message["pin"] = pin;
+    message["value"] = value;
+    bool ret = publishToMqttSafe(PINSTATE_TOPIC_NAME, message);
 
-    // Отправляем состояние пина в MQTT только если подключены
-    if (mosq && isConnected) {
-        json message;
-        message["pin"] = pin;
-        message["value"] = value;
-        std::string payload = message.dump();
-        
-        std::cout << "Publishing MQTT message to topic 'embedded/pins/state': " << payload << std::endl;
-        
-        // Добавляем обработку ошибок и повторные попытки публикации
-        int retries = 3;
-        while (retries > 0) {
-            int rc = mosquitto_publish(mosq, nullptr, "embedded/pins/state", payload.length(), payload.c_str(), 1, false); // QoS=1 для гарантированной доставки
-            if (rc == MOSQ_ERR_SUCCESS) {
-                std::cout << "Successfully published MQTT message" << std::endl;
-                
-                // Важно: нужно вызвать mosquitto_loop для обработки исходящих сообщений
-                mosquitto_loop(mosq, 100, 1); // Даем время на обработку сообщения
-                break;
-            } else if (rc == MOSQ_ERR_NO_CONN) {
-                std::cerr << "No connection to broker, attempting to reconnect..." << std::endl;
-                if (connectToMqtt()) {
-                    mosquitto_loop(mosq, 100, 1);
-                }
-            } else {
-                std::cerr << "Failed to publish MQTT message: " << mosquitto_strerror(rc) << std::endl;
-            }
-            retries--;
-            if (retries > 0) {
-                std::cout << "Retrying publish... (" << retries << " attempts left)" << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-    }
+    if(!ret)
+        std::cout << "Fail to publish pin state"<< std::endl;
+    
+
 }
 
 // Функция для чтения бинарного значения с пина
@@ -173,7 +202,7 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
     try {
         json data = json::parse(payload);
         
-        if (topic == "embedded/control") {
+        if (topic == CONRTORL_TOPIC_NAME) {
             if (data.contains("command")) {
                 std::string command = data["command"];
                 if (command == "restart") {
@@ -187,25 +216,46 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
                     std::cout << "Received set_rgb command" << std::endl; 
                     // Проверяем корректность команды
                     for (const auto& [colorName, pinNumber] : rgbPinSet){
+                        json error_message;
+                        std::stringstream error_text;
+       
                         // Проверяем наличие цвета в парамметрах команды
                         if(!data.contains(colorName)){
-                            std::cout << "Invalid command. No " << colorName << " color in command parameters." << std::endl;
+                            error_text << "Invalid set_rgb command. No " << colorName << " color in command parameters." << std::endl;
+                            std::cout << error_text.str(); 
+                            //Публикуем ошибку на MQTT
+                            error_message["error"]   = error_text.str(); 
+                            bool ret = publishToMqttSafe( ERROR_TOPIC_NAME, error_message);
+                            if(!ret)
+                                std::cout << "Fail to publish temperature"<< std::endl;
                             return;   
                         }
                         
-                        // Проверяем корректное значение пина
+                        // Проверяем корректное значение пина в парамметрах команды
                         auto& field = data[colorName];
                         if(!field.is_number_unsigned()){
-                            std::cout << "Invalid command. Wrong value for "<< colorName << " color."  
+                            error_text << "Invalid set_rgb command. Wrong value for "<< colorName << " color."  
                             <<std::endl;
+                            std::cout << error_text.str(); 
+                            //Публикуем ошибку на MQTT
+                            error_message["error"]   = error_text.str(); 
+                            bool ret = publishToMqttSafe( ERROR_TOPIC_NAME, error_message);
+                            if(!ret)
+                                std::cout << "Fail to publish temperature"<< std::endl;
                             return;      
                         } 
                         
-                        // Проверяем корректное значение пина    
+                        // Проверяем корректное значение пина в парамметрах команды    
                         uint64_t value  = field.get<std::uint64_t>();
                         if( value >  255 ){
-                            std::cout << "Invalid command. Wrong value for "<< colorName << " color."  
+                            error_text << "Invalid set_rgb command. Wrong value for "<< colorName << " color."  
                             << std::endl;
+                            std::cout << error_text.str(); 
+                            //Публикуем ошибку на MQTT
+                            error_message["error"]   = error_text.str(); 
+                            bool ret = publishToMqttSafe( ERROR_TOPIC_NAME, error_message);
+                            if(!ret)
+                                std::cout << "Fail to publish temperature"<< std::endl;
                             return;   
                         } 
                     }    
@@ -245,6 +295,9 @@ void setup() {
     // Настройка пинов
     pinMode(13, true);  // Пин 13 как выход
     pinMode(2, false);  // Пин 2 как вход
+    for (const auto& [colorName, pinNumber] : rgbPinSet)
+        pinMode(pinNumber, true);
+    
     
     // Попытка первоначального подключения
     if (connectToMqtt()) {
@@ -256,10 +309,11 @@ void setup() {
 
 // Функция loop - выполняется циклически
 void loop() {
-    static bool ledState = false;
-    static auto lastMqttTime = std::chrono::steady_clock::now();
-    static auto lastReconnectAttempt = std::chrono::steady_clock::now();
-    
+    static bool ledState                = false;
+    static auto lastMqttTime            = std::chrono::steady_clock::now();
+    static auto lastReconnectAttempt    = std::chrono::steady_clock::now();
+    static auto lastTemperatureUpdate   = std::chrono::steady_clock::now();
+
     // Проверка подключения и попытка реконнекта
     if (!isConnected) {
         auto now = std::chrono::steady_clock::now();
@@ -306,7 +360,23 @@ void loop() {
         digitalWrite(13, ledState);
     }
     
-    uint8_t tempC = analogRead(A0); 
+    //Обновляем температуру если нужно
+    now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTemperatureUpdate).count() >= TEMPERATUE_UPDATE_DELAY) {
+        //Считаем температуру
+        float tempC = analogRead(A0) * COFF_ADC_TO_TEMP_C;
+        std::cout << "Currnte temperature is :"<< tempC << " C."<< std::endl; 
+        
+        //Публикуем заначние на MQTT
+        json message;
+        message["sensor_ID"]   = A0;
+        message["value"]       = tempC;
+        bool ret = publishToMqttSafe( SENSOR_TEMP_TOPIC_NAME, message);
+        if(!ret)
+            std::cout << "Fail to publish temperature"<< std::endl;
+
+        lastTemperatureUpdate = now;
+    }
 
     // Задержка основного цикла
     std::this_thread::sleep_for(std::chrono::milliseconds(MAIN_LOOP_DELAY));
