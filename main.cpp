@@ -295,7 +295,7 @@ void setup() {
     // Настройка пинов
     pinMode(13, true);  // Пин 13 как выход
     pinMode(2, false);  // Пин 2 как вход
-    for (const auto& [colorName, pinNumber] : rgbPinSet)
+    for (const auto& [colorName, pinNumber] : rgbPinSet) //Пины 3, 5, 6 как выход
         pinMode(pinNumber, true);
     
     
